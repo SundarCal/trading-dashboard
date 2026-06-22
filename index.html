@@ -416,7 +416,9 @@ function save(){localStorage.setItem(SK,JSON.stringify(trades));}
 
 // ── P&L MATH ──────────────────────────────────────────
 function calcPnl(t){
-  if(t.exit==null||t.exit==='')return null;
+  // IBKR imports carry pre-calculated realizedPnl
+  if(t.realizedPnl!=null)return t.realizedPnl;
+  if(t.exit==null||t.exit===''||t.exit==='closed')return null;
   const en=parseFloat(t.entry)||0,ex=parseFloat(t.exit)||0,qty=parseFloat(t.qty)||1;
   if(t.type==='Option'){
     const dir=(t.strategy||'').startsWith('Buy')?1:-1;
@@ -430,6 +432,9 @@ function calcPct(t){
   const qty=parseFloat(t.qty)||1;
   const cost=t.type==='Option'?en*qty*100:en*qty;
   return cost?p/cost*100:null;
+}
+function isClosed(t){
+  return t.realizedPnl!=null||( t.exit!=null&&t.exit!==''&&t.exit!=='closed');
 }
 
 // ── DATES ─────────────────────────────────────────────
@@ -493,7 +498,7 @@ function bb(b){const m={IBKR:'b-ibkr',Fidelity:'b-fidelity',Schwab:'b-schwab'};r
 function tb(t){return`<span class="badge ${t==='Stock'?'b-stock':'b-option'}">${t}</span>`;}
 
 function renderStats(){
-  const cl=trades.filter(t=>t.exit!=null&&t.exit!=='');
+  const cl=trades.filter(t=>isClosed(t));
   const tp=cl.reduce((s,t)=>s+(calcPnl(t)||0),0);
   const wins=cl.filter(t=>(calcPnl(t)||0)>0);
   const losses=cl.filter(t=>(calcPnl(t)||0)<0);
@@ -504,20 +509,20 @@ function renderStats(){
     <div class="stat-card"><div class="lbl">Total P&L (all time)</div><div class="val ${tp>=0?'pos':'neg'}">${tp>=0?'+':''}$${Math.abs(tp).toFixed(2)}</div></div>
     <div class="stat-card"><div class="lbl">Win rate</div><div class="val">${wr}%</div></div>
     <div class="stat-card"><div class="lbl">Total trades</div><div class="val">${trades.length}</div></div>
-    <div class="stat-card"><div class="lbl">Open positions</div><div class="val">${trades.filter(t=>t.exit==null||t.exit==='').length}</div></div>
+    <div class="stat-card"><div class="lbl">Open positions</div><div class="val">${trades.filter(t=>!isClosed(t)).length}</div></div>
     <div class="stat-card"><div class="lbl">Avg win</div><div class="val pos">+$${aw.toFixed(2)}</div></div>
     <div class="stat-card"><div class="lbl">Avg loss</div><div class="val neg">-$${Math.abs(al).toFixed(2)}</div></div>`;
 }
 
 function renderPeriodBar(filtered){
-  const cl=filtered.filter(t=>t.exit!=null&&t.exit!=='');
+  const cl=filtered.filter(t=>isClosed(t));
   const tp=cl.reduce((s,t)=>s+(calcPnl(t)||0),0);
   const pcts=cl.map(t=>calcPct(t)).filter(p=>p!==null);
   const ap=pcts.length?pcts.reduce((a,b)=>a+b,0)/pcts.length:null;
   const wins=cl.filter(t=>(calcPnl(t)||0)>0).length;
   const losses=cl.filter(t=>(calcPnl(t)||0)<0).length;
   const wr=cl.length?Math.round(wins/cl.length*100):0;
-  const open=filtered.filter(t=>t.exit==null||t.exit==='').length;
+  const open=filtered.filter(t=>!isClosed(t)).length;
   const pc=tp>=0?'pos':'neg';const ac=ap!==null?(ap>=0?'pos':'neg'):'';
   document.getElementById('period-bar').innerHTML=`
     <div class="pb-item"><div class="pb-lbl">Period</div><div class="pb-val" style="font-size:13px">${getPeriodLabel()}</div></div>
@@ -546,7 +551,7 @@ function renderTable(filtered){
       <td style="color:var(--text2);font-size:12px">${t.strategy||'—'}</td>
       <td style="color:var(--text2)">${qty}</td>
       <td>$${parseFloat(t.entry||0).toFixed(2)}</td>
-      <td>${t.exit!=null&&t.exit!==''?'$'+parseFloat(t.exit).toFixed(2):'<span class="open-label">Open</span>'}</td>
+      <td>${isClosed(t)&&t.exit!=='closed'?'$'+parseFloat(t.exit).toFixed(2):(t.realizedPnl!=null?'<span style="font-size:11px;color:var(--text3)">via IBKR</span>':'<span class="open-label">Open</span>')}</td>
       <td>${fmtD(p)}</td>
       <td>${fmtP(pp)}</td>
       <td style="font-size:12px;color:var(--text2);max-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${t.notes||''}</td>
@@ -674,32 +679,91 @@ function handleCSV(e){
 }
 
 function parseCSV(text,broker){
-  const lines=text.split('\n').map(l=>l.trim()).filter(l=>l&&!l.startsWith('"Brokerage')&&!l.startsWith('"Disclosure'));
+  // auto-detect delimiter: tab or comma
+  const firstLine=text.split('\n')[0]||'';
+  const delim=firstLine.includes('\t')?'\t':',';
+
+  const lines=text.split('\n').map(l=>l.trim()).filter(l=>l);
   if(lines.length<2)return{count:0,rows:[]};
-  const rawHeader=lines[0];
-  const header=rawHeader.split(',').map(h=>h.trim().replace(/"/g,'').toLowerCase());
+
+  // find header line (skip any preamble lines that don't look like headers)
+  let headerIdx=0;
+  for(let i=0;i<Math.min(10,lines.length);i++){
+    const low=lines[i].toLowerCase();
+    if(broker==='IBKR'&&(low.includes('tradedate')||low.includes('tradeprice')||low.includes('symbol'))){headerIdx=i;break;}
+    if(broker==='Fidelity'&&(low.includes('run date')||low.includes('symbol'))){headerIdx=i;break;}
+    if(broker==='Schwab'&&(low.includes('action')||low.includes('symbol'))){headerIdx=i;break;}
+  }
+
+  const header=splitLine(lines[headerIdx],delim).map(h=>h.trim().replace(/"/g,'').toLowerCase());
   const rows=[];
-  for(let i=1;i<lines.length;i++){
+
+  for(let i=headerIdx+1;i<lines.length;i++){
     const line=lines[i];
-    if(!line||line.startsWith(',,'))continue;
-    const cols=splitCSVLine(line);
-    const row={};header.forEach((h,j)=>row[h]=cols[j]?cols[j].trim().replace(/"/g,''):'');
+    if(!line)continue;
+    const cols=splitLine(line,delim);
+    const row={};
+    header.forEach((h,j)=>row[h]=(cols[j]||'').trim().replace(/"/g,''));
+
     try{
       let t={broker,type:'Stock',strategy:'',expiry:'',strike:'',notes:'',exit:''};
+
       if(broker==='IBKR'){
-        t.date=cleanDate(row['date/time']||row['datetime']||row['date']||'');
-        t.symbol=cleanSymbol(row['symbol']||'');
+        // Skip non-trade rows
+        const levelOfDetail=(row['levelofdetail']||row['level of detail']||'').toUpperCase();
+        if(levelOfDetail&&levelOfDetail!=='EXECUTION')continue;
+
+        // Date: TradeDate is YYYYMMDD e.g. "20260331"
+        const rawDate=row['tradedate']||row['datetime']||'';
+        t.date=cleanDate(rawDate);
+
+        // Symbol: use UnderlyingSymbol for options (clean ticker like "BE"),
+        // fall back to Symbol field
+        const underSym=(row['underlyingsymbol']||'').trim();
+        const rawSym=(row['symbol']||'').trim();
+        t.symbol=underSym?underSym.toUpperCase():cleanSymbol(rawSym);
+
+        // Quantity (absolute)
         t.qty=Math.abs(parseFloat(row['quantity'])||1);
-        t.entry=parseFloat(row['t. price']||row['tradeprice']||row['price']||0)||0;
-        const ac=(row['asset category']||row['assetcategory']||'').toLowerCase();
-        const desc=(row['description']||'').toLowerCase();
-        if(ac.includes('option')||desc.includes('put')||desc.includes('call')){
+
+        // Price
+        t.entry=Math.abs(parseFloat(row['tradeprice'])||0);
+
+        // Asset class
+        const ac=(row['assetclass']||'').toUpperCase();
+        const pc=(row['put/call']||'').toUpperCase();
+        const buySell=(row['buy/sell']||'').toUpperCase();
+
+        if(ac==='OPT'||ac==='FOP'){
           t.type='Option';
-          t.strategy=desc.includes('put')?'Sell Put':'Sell Call';
-          const m=desc.match(/([a-z]+)\s+(\d+)\s+(put|call)/i);
-          if(m){t.strike=m[2];}
+          // Strategy: combine Put/Call with Buy/Sell
+          if(buySell==='SELL'||buySell==='SLD'){
+            t.strategy=pc==='P'?'Sell Put':'Sell Call';
+          } else {
+            t.strategy=pc==='P'?'Buy Put':'Buy Call';
+          }
+          t.strike=row['strike']||'';
+          // Expiry: YYYYMMDD → YYYY-MM-DD
+          const exp=row['expiry']||'';
+          t.expiry=exp.length===8?`${exp.slice(0,4)}-${exp.slice(4,6)}-${exp.slice(6,8)}`:exp;
+
+          // P&L: use FifoPnlRealized for closed legs (non-zero)
+          const fifo=parseFloat(row['fifopnlrealized']||0);
+          // NetCash already includes commission; use it for the exit price equivalent
+          // We store realized PnL directly; set exit to signal it's closed
+          if(fifo!==0){
+            t.realizedPnl=fifo;
+            t.exit='closed'; // marker so calcPnl knows it's closed
+          }
+        } else {
+          t.type='Stock';
+          t.strategy='';
+          const fifo=parseFloat(row['fifopnlrealized']||0);
+          if(fifo!==0){t.realizedPnl=fifo;t.exit='closed';}
         }
+
         t.notes=row['description']||'';
+
       } else if(broker==='Fidelity'){
         t.date=cleanDate(row['run date']||row['date']||row['settlement date']||'');
         t.symbol=cleanSymbol(row['symbol']||'');
@@ -709,10 +773,9 @@ function parseCSV(text,broker){
         if(action.includes('put')||action.includes('call')||action.includes('option')){
           t.type='Option';
           t.strategy=action.includes('put')?'Sell Put':action.includes('call')?'Sell Call':'Other';
-        } else if(action.includes('sold')||action.includes('buy')||action.includes('bought')){
-          t.type='Stock';
         }
         t.notes=row['description']||row['action']||'';
+
       } else if(broker==='Schwab'){
         t.date=cleanDate(row['date']||'');
         t.symbol=cleanSymbol(row['symbol']||'');
@@ -726,13 +789,16 @@ function parseCSV(text,broker){
         }
         t.notes=row['description']||'';
       }
-      if(t.symbol&&t.entry>0)rows.push(t);
-    }catch(err){}
+
+      if(t.symbol&&(t.entry>0||t.realizedPnl!=null))rows.push(t);
+    }catch(err){console.warn('Row parse error:',err,lines[i]);}
   }
   return{count:rows.length,rows};
 }
 
-function splitCSVLine(line){
+function splitLine(line,delim){
+  if(delim==='\t')return line.split('\t');
+  // comma with quote handling
   const result=[];let cur='';let inQ=false;
   for(let i=0;i<line.length;i++){
     if(line[i]==='"'){inQ=!inQ;}
@@ -742,9 +808,16 @@ function splitCSVLine(line){
   result.push(cur);return result;
 }
 
+
+
 function cleanDate(s){
   if(!s)return'';
+  s=s.split(';')[0].trim(); // strip IBKR time suffix e.g. "20260331;103512"
+  // YYYYMMDD (IBKR)
+  if(/^\d{8}$/.test(s))return`${s.slice(0,4)}-${s.slice(4,6)}-${s.slice(6,8)}`;
+  // YYYY-MM-DD
   const m=s.match(/(\d{4})-(\d{2})-(\d{2})/);if(m)return`${m[1]}-${m[2]}-${m[3]}`;
+  // MM/DD/YYYY or MM/DD/YY
   const m2=s.match(/(\d{1,2})\/(\d{1,2})\/(\d{2,4})/);
   if(m2){const y=m2[3].length===2?'20'+m2[3]:m2[3];return`${y}-${m2[1].padStart(2,'0')}-${m2[2].padStart(2,'0')}`;}
   return s.slice(0,10);
