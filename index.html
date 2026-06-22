@@ -360,6 +360,7 @@ td.actions{white-space:nowrap;text-align:right}
     </div>
     <div class="upload-status" id="upload-status"></div>
     <div class="modal-footer">
+      <button class="btn" style="color:var(--red)" onclick="resetTrades()">🗑 Reset all trades</button>
       <button class="btn" onclick="closeModal('modal-upload')">Close</button>
     </div>
   </div>
@@ -663,15 +664,32 @@ function handleCSV(e){
   const reader=new FileReader();
   reader.onload=ev=>{
     const text=ev.target.result;
-    const result=parseCSV(text,curBroker);
     const st=document.getElementById('upload-status');
+
+    // --- DEBUG: show first 3 lines and detected headers ---
+    const lines=text.split('\n').filter(l=>l.trim());
+    const delim=lines[0].includes('\t')?'\t':',';
+    const headers=splitLine(lines[0],delim).map(h=>h.replace(/"/g,'').trim().toLowerCase());
+
+    console.log('=== CSV DEBUG ===');
+    console.log('Lines total:',lines.length);
+    console.log('Delimiter:',delim==='\t'?'TAB':'COMMA');
+    console.log('Headers detected:',headers);
+    console.log('Line 2 sample:',lines[1]||'(none)');
+
+    const result=parseCSV(text,curBroker);
+
     if(!result.count){
       st.className='upload-status err';
-      st.textContent=`No trades found in this file. Make sure you selected the right broker and file format.`;
+      st.innerHTML=`❌ No trades found.<br>
+        <small>File had <b>${lines.length}</b> lines, delimiter: <b>${delim==='\t'?'TAB':'COMMA'}</b><br>
+        Headers found: <b>${headers.slice(0,6).join(', ')}...</b><br>
+        Open browser console (F12) for full debug info.<br>
+        <br>💡 Try the <b>Reset & Re-upload</b> button below to clear and try again.</small>`;
     } else {
       trades=[...trades,...result.rows];save();renderAll();
       st.className='upload-status ok';
-      st.textContent=`✓ Successfully imported ${result.count} trades from ${curBroker}.`;
+      st.textContent=`✓ Imported ${result.count} trades from ${curBroker}. Total trades: ${trades.length}.`;
     }
     e.target.value='';
   };
@@ -679,119 +697,88 @@ function handleCSV(e){
 }
 
 function parseCSV(text,broker){
-  // auto-detect delimiter: tab or comma
-  const firstLine=text.split('\n')[0]||'';
-  const delim=firstLine.includes('\t')?'\t':',';
-
-  const lines=text.split('\n').map(l=>l.trim()).filter(l=>l);
+  const lines=text.split('\n').filter(l=>l.trim());
   if(lines.length<2)return{count:0,rows:[]};
-
-  // find header line (skip any preamble lines that don't look like headers)
-  let headerIdx=0;
-  for(let i=0;i<Math.min(10,lines.length);i++){
-    const low=lines[i].toLowerCase();
-    if(broker==='IBKR'&&(low.includes('tradedate')||low.includes('tradeprice')||low.includes('symbol'))){headerIdx=i;break;}
-    if(broker==='Fidelity'&&(low.includes('run date')||low.includes('symbol'))){headerIdx=i;break;}
-    if(broker==='Schwab'&&(low.includes('action')||low.includes('symbol'))){headerIdx=i;break;}
-  }
-
-  const header=splitLine(lines[headerIdx],delim).map(h=>h.trim().replace(/"/g,'').toLowerCase());
+  const firstLine=lines[0];
+  const delim=firstLine.includes('\t')?'\t':',';
+  const header=splitLine(firstLine,delim).map(h=>h.replace(/"/g,'').trim().toLowerCase());
   const rows=[];
 
-  for(let i=headerIdx+1;i<lines.length;i++){
-    const line=lines[i];
-    if(!line)continue;
+  function g(row,key){return(row[key]||'').trim();}
+
+  for(let i=1;i<lines.length;i++){
+    const line=lines[i];if(!line.trim())continue;
     const cols=splitLine(line,delim);
     const row={};
-    header.forEach((h,j)=>row[h]=(cols[j]||'').trim().replace(/"/g,''));
+    header.forEach((h,j)=>row[h]=(cols[j]||'').replace(/"/g,'').trim());
 
     try{
       let t={broker,type:'Stock',strategy:'',expiry:'',strike:'',notes:'',exit:''};
 
       if(broker==='IBKR'){
-        // Skip non-trade rows
-        const levelOfDetail=(row['levelofdetail']||row['level of detail']||'').toUpperCase();
-        if(levelOfDetail&&levelOfDetail!=='EXECUTION')continue;
+        // Only process EXECUTION level rows (skip summary/order rows if column exists)
+        const lod=g(row,'levelofdetail');
+        if(lod&&lod.toUpperCase()!=='EXECUTION')continue;
 
-        // Date: TradeDate is YYYYMMDD e.g. "20260331"
-        const rawDate=row['tradedate']||row['datetime']||'';
-        t.date=cleanDate(rawDate);
+        t.date=cleanDate(g(row,'tradedate')||g(row,'datetime'));
+        // Use underlyingsymbol for options, symbol for stocks
+        const us=g(row,'underlyingsymbol');
+        t.symbol=(us||cleanSymbol(g(row,'symbol'))).toUpperCase();
+        t.qty=Math.abs(parseFloat(g(row,'quantity'))||1);
+        t.entry=Math.abs(parseFloat(g(row,'tradeprice'))||0);
 
-        // Symbol: use UnderlyingSymbol for options (clean ticker like "BE"),
-        // fall back to Symbol field
-        const underSym=(row['underlyingsymbol']||'').trim();
-        const rawSym=(row['symbol']||'').trim();
-        t.symbol=underSym?underSym.toUpperCase():cleanSymbol(rawSym);
+        const ac=g(row,'assetclass').toUpperCase();
+        const pc=g(row,'put/call').toUpperCase();
+        const bs=g(row,'buy/sell').toUpperCase();
 
-        // Quantity (absolute)
-        t.qty=Math.abs(parseFloat(row['quantity'])||1);
-
-        // Price
-        t.entry=Math.abs(parseFloat(row['tradeprice'])||0);
-
-        // Asset class
-        const ac=(row['assetclass']||'').toUpperCase();
-        const pc=(row['put/call']||'').toUpperCase();
-        const buySell=(row['buy/sell']||'').toUpperCase();
-
-        if(ac==='OPT'||ac==='FOP'){
+        if(ac==='OPT'||ac==='FOP'||pc==='P'||pc==='C'){
           t.type='Option';
-          // Strategy: combine Put/Call with Buy/Sell
-          if(buySell==='SELL'||buySell==='SLD'){
-            t.strategy=pc==='P'?'Sell Put':'Sell Call';
-          } else {
-            t.strategy=pc==='P'?'Buy Put':'Buy Call';
-          }
-          t.strike=row['strike']||'';
-          // Expiry: YYYYMMDD → YYYY-MM-DD
-          const exp=row['expiry']||'';
+          const isSell=bs==='SELL'||bs==='SLD';
+          t.strategy=isSell?(pc==='P'?'Sell Put':'Sell Call'):(pc==='P'?'Buy Put':'Buy Call');
+          t.strike=g(row,'strike');
+          const exp=g(row,'expiry');
           t.expiry=exp.length===8?`${exp.slice(0,4)}-${exp.slice(4,6)}-${exp.slice(6,8)}`:exp;
-
-          // P&L: use FifoPnlRealized for closed legs (non-zero)
-          const fifo=parseFloat(row['fifopnlrealized']||0);
-          // NetCash already includes commission; use it for the exit price equivalent
-          // We store realized PnL directly; set exit to signal it's closed
-          if(fifo!==0){
-            t.realizedPnl=fifo;
-            t.exit='closed'; // marker so calcPnl knows it's closed
-          }
         } else {
           t.type='Stock';
-          t.strategy='';
-          const fifo=parseFloat(row['fifopnlrealized']||0);
-          if(fifo!==0){t.realizedPnl=fifo;t.exit='closed';}
+          t.strategy=bs==='SELL'||bs==='SLD'?'Sell':'Buy';
         }
 
-        t.notes=row['description']||'';
+        const fifo=parseFloat(g(row,'fifopnlrealized'))||0;
+        if(fifo!==0){t.realizedPnl=fifo;t.exit='closed';}
+        t.notes=g(row,'description');
+
+        // Accept row if we have a symbol, regardless of entry price
+        if(t.symbol)rows.push(t);
 
       } else if(broker==='Fidelity'){
-        t.date=cleanDate(row['run date']||row['date']||row['settlement date']||'');
-        t.symbol=cleanSymbol(row['symbol']||'');
-        t.qty=Math.abs(parseFloat(row['quantity'])||1);
-        t.entry=Math.abs(parseFloat(row['price'])||0);
-        const action=(row['action']||'').toLowerCase();
+        t.date=cleanDate(g(row,'run date')||g(row,'date')||g(row,'settlement date'));
+        t.symbol=cleanSymbol(g(row,'symbol'));
+        t.qty=Math.abs(parseFloat(g(row,'quantity'))||1);
+        t.entry=Math.abs(parseFloat(g(row,'price'))||0);
+        const action=g(row,'action').toLowerCase();
         if(action.includes('put')||action.includes('call')||action.includes('option')){
           t.type='Option';
           t.strategy=action.includes('put')?'Sell Put':action.includes('call')?'Sell Call':'Other';
         }
-        t.notes=row['description']||row['action']||'';
+        t.notes=g(row,'description')||g(row,'action');
+        if(t.symbol)rows.push(t);
 
       } else if(broker==='Schwab'){
-        t.date=cleanDate(row['date']||'');
-        t.symbol=cleanSymbol(row['symbol']||'');
-        t.qty=Math.abs(parseFloat(row['quantity'])||1);
-        t.entry=Math.abs(parseFloat((row['price']||'').replace(/[$,]/g,''))||0);
-        const action=(row['action']||'').toLowerCase();
-        const desc=(row['description']||'').toLowerCase();
+        t.date=cleanDate(g(row,'date'));
+        t.symbol=cleanSymbol(g(row,'symbol'));
+        t.qty=Math.abs(parseFloat(g(row,'quantity'))||1);
+        t.entry=Math.abs(parseFloat(g(row,'price').replace(/[$,]/g,''))||0);
+        const action=g(row,'action').toLowerCase();
+        const desc=g(row,'description').toLowerCase();
         if(action.includes('put')||action.includes('call')||desc.includes('put')||desc.includes('call')){
           t.type='Option';
           t.strategy=(action+desc).includes('put')?'Sell Put':'Sell Call';
         }
-        t.notes=row['description']||'';
+        t.notes=g(row,'description');
+        if(t.symbol)rows.push(t);
       }
 
-      if(t.symbol&&(t.entry>0||t.realizedPnl!=null))rows.push(t);
-    }catch(err){console.warn('Row parse error:',err,lines[i]);}
+    }catch(err){console.warn('Row error line',i,err);}
   }
   return{count:rows.length,rows};
 }
@@ -845,6 +832,13 @@ function saveSettings(){
   if(pw&&pw.length<4){alert('Password must be at least 4 characters.');return;}
   if(pw){localStorage.setItem(PK,pw);alert('✓ Password updated!');}
   closeModal('modal-settings');
+}
+function resetTrades(){
+  if(!confirm('This will DELETE all imported trades so you can start fresh. Continue?'))return;
+  trades=[];save();renderAll();
+  const st=document.getElementById('upload-status');
+  st.className='upload-status ok';
+  st.textContent='✓ All trades cleared. You can now re-upload your CSV files.';
 }
 function clearAllData(){
   if(!confirm('DELETE ALL trade data? This cannot be undone.'))return;
