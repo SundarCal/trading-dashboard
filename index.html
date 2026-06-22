@@ -504,6 +504,57 @@ function getFiltered(){
   });
 }
 
+// ── GROUP OPTIONS TRADES ──────────────────────────────
+function groupOptionsTrades(filtered){
+  const groups=[];const used=new Set();
+
+  for(let i=0;i<filtered.length;i++){
+    if(used.has(i)||filtered[i].type!=='Option')continue;
+
+    const trade=filtered[i];
+    const pair={trades:[trade],indices:[i],entry:null,exit:null};
+    used.add(i);
+
+    // Find matching sell/buy for this option
+    for(let j=i+1;j<filtered.length;j++){
+      if(used.has(j))continue;
+      const other=filtered[j];
+      if(other.type!=='Option')continue;
+
+      // Match on: symbol, strike, expiry, and opposite strategy
+      const match=other.symbol===trade.symbol&&other.strike===trade.strike&&other.expiry===trade.expiry;
+      if(!match)continue;
+
+      const isOppositeStrat=(trade.strategy||'').startsWith('Buy')!==(other.strategy||'').startsWith('Buy');
+      if(isOppositeStrat){
+        pair.trades.push(other);
+        pair.indices.push(j);
+        used.add(j);
+        break;
+      }
+    }
+
+    // Set entry/exit: entry from first trade, exit from second (if exists)
+    const buyTrade=pair.trades.find(t=>(t.strategy||'').startsWith('Buy'));
+    const sellTrade=pair.trades.find(t=>(t.strategy||'').startsWith('Sell'));
+
+    pair.entry=(buyTrade||pair.trades[0]).entry;
+    pair.exit=(sellTrade||pair.trades[1])?.exit||(sellTrade||pair.trades[1])?.entry||null;
+    pair.strategy=pair.trades.map(t=>t.strategy).join(' → ');
+    pair.date=pair.trades[0].date;
+    pair.symbol=trade.symbol;
+    pair.strike=trade.strike;
+    pair.expiry=trade.expiry;
+    pair.broker=trade.broker;
+    pair.qty=trade.qty;
+    pair.notes=(pair.trades.map(t=>t.notes).filter(n=>n).join('; '))||'';
+
+    groups.push(pair);
+  }
+
+  return groups;
+}
+
 // ── RENDER ────────────────────────────────────────────
 function fmtD(n){if(n===null)return'<span class="open-label">Open</span>';const s=n>=0?'+':'';return`<span class="${n>=0?'pos':'neg'}">${s}$${Math.abs(n).toFixed(2)}</span>`;}
 function fmtP(n){if(n===null)return'<span class="open-label">—</span>';const s=n>=0?'+':'';return`<span class="${n>=0?'pos':'neg'}">${s}${Math.abs(n).toFixed(2)}%</span>`;}
@@ -547,15 +598,41 @@ function renderPeriodBar(filtered){
 }
 
 function renderTable(filtered){
-  const tb=document.getElementById('tbody');
+  const tbody=document.getElementById('tbody');
   const em=document.getElementById('empty-state');
-  if(!filtered.length){tb.innerHTML='';em.style.display='block';return;}
+  if(!filtered.length){tbody.innerHTML='';em.style.display='block';return;}
   em.style.display='none';
-  tb.innerHTML=filtered.map(t=>{
-    const ri=trades.indexOf(t);
-    const p=calcPnl(t),pp=calcPct(t);
+
+  // Group options trades, keep stocks as-is
+  let displayItems=[];
+  if(curTab==='options'){
+    const groups=groupOptionsTrades(filtered);
+    displayItems=groups.map(g=>({...g,isGroup:true}));
+  } else {
+    displayItems=filtered.map((t,idx)=>({...t,indices:[trades.indexOf(t)],isGroup:false}));
+  }
+
+  tbody.innerHTML=displayItems.map(item=>{
+    const t=item.isGroup?item:item;
+    const entry=parseFloat(t.entry||0);
+    const exit=parseFloat(t.exit||0);
     const qty=t.type==='Option'?`${t.qty} ct`:`${t.qty} sh`;
     const strike=t.strike?`<span class="strike-info">$${t.strike}${t.expiry?' · '+t.expiry:''}</span>`:'';
+
+    let p=null,pp=null;
+    if(item.isGroup){
+      // For grouped options: P&L = (exit - entry) * qty * 100
+      if(t.exit&&t.exit!==''&&t.exit!=='closed'){
+        p=(exit-entry)*t.qty*100;
+        pp=(p/(entry*t.qty*100))*100;
+      }
+    } else {
+      p=calcPnl(t);pp=calcPct(t);
+    }
+
+    const exitDisplay=t.exit&&t.exit!==''&&t.exit!=='closed'?'$'+parseFloat(t.exit).toFixed(2):(t.realizedPnl!=null?'<span style="font-size:11px;color:var(--text3)">via IBKR</span>':'<span class="open-label">Open</span>');
+    const riDisplay=item.isGroup?`group-${item.indices.join(',')}`:item.indices[0];
+
     return`<tr>
       <td>${t.date||'—'}</td>
       <td>${bb(t.broker)}</td>
@@ -563,14 +640,13 @@ function renderTable(filtered){
       <td>${tb(t.type)}</td>
       <td style="color:var(--text2);font-size:12px">${t.strategy||'—'}</td>
       <td style="color:var(--text2)">${qty}</td>
-      <td>$${parseFloat(t.entry||0).toFixed(2)}</td>
-      <td>${isClosed(t)&&t.exit!=='closed'?'$'+parseFloat(t.exit).toFixed(2):(t.realizedPnl!=null?'<span style="font-size:11px;color:var(--text3)">via IBKR</span>':'<span class="open-label">Open</span>')}</td>
+      <td>$${entry.toFixed(2)}</td>
+      <td>${exitDisplay}</td>
       <td>${fmtD(p)}</td>
       <td>${fmtP(pp)}</td>
       <td style="font-size:12px;color:var(--text2);max-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${t.notes||''}</td>
       <td class="actions">
-        <button class="btn btn-sm" onclick="openEdit(${ri})" title="Edit">✏</button>
-        <button class="btn btn-sm btn-danger" onclick="delTrade(${ri})" title="Delete">🗑</button>
+        ${!item.isGroup?`<button class="btn btn-sm" onclick="openEdit(${item.indices[0]})" title="Edit">✏</button><button class="btn btn-sm btn-danger" onclick="delTrade(${item.indices[0]})" title="Delete">🗑</button>`:'<span style="font-size:11px;color:var(--text3)">paired</span>'}
       </td>
     </tr>`;
   }).join('');
