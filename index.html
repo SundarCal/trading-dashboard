@@ -386,7 +386,19 @@ td.actions{white-space:nowrap;text-align:right}
 </div>
 
 <script>
-const SK='tpnl_v2';const PK='tpnl_pw';
+const SK='tpnl_trades';const PK='tpnl_pw';
+// Migrate any data from old keys
+(function migrate(){
+  const keys=['tpnl_v2','tpnl_trades_v2'];
+  keys.forEach(k=>{
+    const old=localStorage.getItem(k);
+    if(old&&!localStorage.getItem(SK)){
+      localStorage.setItem(SK,old);
+      localStorage.removeItem(k);
+      console.log('Migrated data from',k);
+    }
+  });
+})();
 let trades=[];let editIdx=null;let curTab='all';let curBroker='IBKR';
 
 // ── AUTH ──────────────────────────────────────────────
